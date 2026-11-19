@@ -2,10 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
-import { ApiError, downloadReport, getRun, listScenarios, startRun, type JsonValue, type RunReport, type ScenarioSummary } from "@/lib/api";
-import { ApiError, RateLimitError, getRun, getScenario, listScenarios, startRun, type JsonValue, type RunReport, type ScenarioDetail, type ScenarioSummary } from "@/lib/api";
+import { ApiError, RateLimitError, cancelRun, downloadReport, getRun, getScenario, listScenarios, startRun, type JsonValue, type RunReport, type ScenarioDetail, type ScenarioSummary } from "@/lib/api";
 
-const terminalStatuses = new Set(["passed", "failed"]);
+const terminalStatuses = new Set(["passed", "failed", "cancelled"]);
 
 export type ScenarioFilter = "all" | "xlm" | "issued-asset" | "expected-failure";
 export type SortOrder = "name-asc" | "name-desc" | "id-asc";
@@ -37,8 +36,6 @@ export const FILTER_OPTIONS: { key: ScenarioFilter; label: string }[] = [
   { key: "expected-failure", label: "Expected Failure" },
 ];
 
-
-export type ReportFilter = "all" | "failed";
 
 export const REPORT_FILTER_OPTIONS: { key: ReportFilter; label: string }[] = [
   { key: "all", label: "All" },
@@ -98,7 +95,6 @@ export function Dashboard() {
   const [scenarios, setScenarios] = useState<ScenarioSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
   const [run, setRun] = useState<RunReport | null>(null);
-  const [reportFilter, setReportFilter] = useState<ReportFilter>("all");
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -243,7 +239,11 @@ export function Dashboard() {
       .catch((reason: unknown) => {
         if (!active) return;
         if (reason instanceof DOMException && reason.name === "AbortError") return;
-        setRestorationError(readError(reason));
+        if (reason instanceof ApiError && (reason.status === 404 || reason.code === "RUN_NOT_FOUND")) {
+          setRestorationError("Run not found");
+        } else {
+          setRestorationError(readError(reason));
+        }
       })
       .finally(() => {
         if (active) setRestoringRun(false);
@@ -744,7 +744,7 @@ export function Dashboard() {
                 <ScenarioIcon kind={scenario.id} />
                 <span className="scenario-name">{scenario.name}</span>
                 <span className="scenario-description">{scenario.description}</span>
-                <span className="version">V{scenario.version}</span>
+                <span className="version" aria-label={`Scenario version ${scenario.version}`} title={`Scenario version ${scenario.version}`}>V{scenario.version}</span>
                 <button
                   type="button"
                   className={`favorite-btn ${favorites.has(scenario.id) ? "active" : ""}`}
@@ -923,7 +923,7 @@ export function Dashboard() {
           ) : restorationError ? (
             <div className="empty-report">
               <div className="empty-glyph"><WarningIcon /></div>
-              <strong>Run unavailable</strong>
+              <strong>Run not found</strong>
               <p>{restorationError}</p>
               <button type="button" className="run-button run-button--secondary" style={{ marginTop: '16px', minWidth: 'auto', padding: '10px 16px' }} onClick={clearRestoration}>Dismiss</button>
             </div>
@@ -933,9 +933,9 @@ export function Dashboard() {
         ) : (
           <RunView
             run={run}
-            isOffline={isOffline}
             reportFilter={reportFilter}
             scenarioName={scenarios.find((scenario) => scenario.id === run.scenarioId)?.name ?? run.scenarioId}
+            onCancelled={setRun}
           />
         )}
       </section>
@@ -945,11 +945,13 @@ export function Dashboard() {
   );
 }
 
-function RunView({ run, reportFilter, scenarioName }: { run: RunReport; reportFilter: ReportFilter; scenarioName: string }) {
+function RunView({ run, reportFilter, scenarioName, onCancelled }: { run: RunReport; reportFilter: ReportFilter; scenarioName: string; onCancelled?: (run: RunReport) => void }) {
   const isTerminal = terminalStatuses.has(run.status);
   const [now, setNow] = useState(() => Date.now());
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isTerminal) return;
@@ -1008,6 +1010,20 @@ function RunView({ run, reportFilter, scenarioName }: { run: RunReport; reportFi
     }
   };
 
+  const handleCancel = async () => {
+    if (cancelling || isTerminal) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      const cancelled = await cancelRun(run.id);
+      onCancelled?.(cancelled);
+    } catch (reason: unknown) {
+      setCancelError(readError(reason));
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   const visibleSteps = run.steps
     .map((step, index) => ({ step, index }))
     .filter(({ step }) => reportFilter === "all" || step.status === "failed");
@@ -1043,7 +1059,18 @@ function RunView({ run, reportFilter, scenarioName }: { run: RunReport; reportFi
             Retention is not guaranteed; a report already loaded stays visible here.
           </p>
         )}
-        {!isTerminal && <div className="running-row"><span className="spinner" /><div><strong>{titleCase(run.status)}</strong><span>SoroLink is executing this flow on Stellar Testnet.</span></div></div>}
+        {!isTerminal && (
+          <>
+            <div className="running-row">
+              <span className="spinner" />
+              <div><strong>{titleCase(run.status)}</strong><span>SoroLink is executing this flow on Stellar Testnet.</span></div>
+              <button type="button" className="run-button run-button--secondary cancel-run-button" disabled={cancelling} onClick={handleCancel}>
+                {cancelling ? "Cancelling…" : "Cancel"}
+              </button>
+            </div>
+            {cancelError && <div className="error-banner" role="alert"><WarningIcon /><div><strong>Could not cancel run</strong><span>{cancelError}</span></div></div>}
+          </>
+        )}
         {reportFilter === "failed" && visibleSteps.length === 0 && visibleAssertions.length === 0 && (
           <div className="empty-checks" role="status">
             <strong>No failed checks</strong>
