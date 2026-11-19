@@ -6,7 +6,7 @@ export interface ScenarioSummary {
   contentHash: string;
 }
 
-export type RunStatus = "requested" | "validating" | "running" | "passed" | "failed";
+export type RunStatus = "requested" | "validating" | "running" | "passed" | "failed" | "cancelled";
 
 export interface StepResult {
   id: string;
@@ -89,6 +89,10 @@ export function startRun(scenarioId: string, idempotencyKey?: string): Promise<R
 
 export function getRun(runId: string, signal?: AbortSignal): Promise<RunReport> {
   return request(`/api/backend/api/v1/runs/${encodeURIComponent(runId)}`, { signal }, isRunReport);
+}
+
+export function cancelRun(runId: string, signal?: AbortSignal): Promise<RunReport> {
+  return request(`/api/backend/api/v1/runs/${encodeURIComponent(runId)}`, { method: "DELETE", signal }, isRunReport);
 }
 
 export function downloadReport(runId: string, signal?: AbortSignal): Promise<RunReport> {
@@ -199,7 +203,7 @@ export function isRunReport(value: unknown): value is RunReport {
     || value.scenarioSchemaVersion !== 1
     || !isString(value.scenarioContentHash)
     || value.network !== "testnet"
-    || !["requested", "validating", "running", "passed", "failed"].includes(String(value.status))
+    || !["requested", "validating", "running", "passed", "failed", "cancelled"].includes(String(value.status))
     || !isString(value.createdAt)
     || (value.completedAt !== undefined && !isString(value.completedAt))
     || !Array.isArray(value.steps)

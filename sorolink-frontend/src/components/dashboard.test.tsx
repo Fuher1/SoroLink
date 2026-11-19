@@ -490,6 +490,39 @@ describe("Dashboard URL Restoration", () => {
     expect(startRunMock).not.toHaveBeenCalled(); // Absense of POST request on restore
   });
 
+  it("cancels an in-progress run and disables the cancel action after cancellation", async () => {
+    mockSearchParams = new URLSearchParams("?runId=run-running");
+    const runningRun = { ...mockRun, id: "run-running", status: "running" as const };
+    const cancelledRun = { ...runningRun, status: "cancelled" as const };
+    vi.spyOn(api, "getRun").mockResolvedValue(runningRun);
+    vi.spyOn(api, "cancelRun").mockResolvedValue(cancelledRun);
+
+    render(<Dashboard />);
+
+    const cancelButton = await screen.findByRole("button", { name: "Cancel" });
+    fireEvent.click(cancelButton);
+
+    await waitFor(() => {
+      expect(api.cancelRun).toHaveBeenCalledWith("run-running");
+    });
+    expect(await screen.findByText("Cancelled")).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
+  it("shows an error if cancelling a run fails", async () => {
+    mockSearchParams = new URLSearchParams("?runId=run-running");
+    const runningRun = { ...mockRun, id: "run-running", status: "running" as const };
+    vi.spyOn(api, "getRun").mockResolvedValue(runningRun);
+    vi.spyOn(api, "cancelRun").mockRejectedValue(new Error("Cancellation failed"));
+
+    render(<Dashboard />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByText("Could not cancel run")).toBeDefined();
+    expect(screen.getByText("Cancellation failed")).toBeDefined();
+  });
+
   it("shows unavailable state for missing run", async () => {
     mockSearchParams = new URLSearchParams("?runId=invalid-run");
     const getRunMock = vi.spyOn(api, "getRun").mockRejectedValue(new Error("Not found"));
@@ -497,8 +530,7 @@ describe("Dashboard URL Restoration", () => {
     render(<Dashboard />);
     
     // Should show error state
-    await screen.findByText("Run unavailable");
-    expect(screen.getByText("Not found")).toBeDefined();
+    await screen.findByText("Run not found");
     
     // Clicking dismiss clears URL
     const dismissButton = screen.getByRole("button", { name: /Dismiss/i });
