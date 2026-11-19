@@ -1,4 +1,4 @@
-export type RunStatus = "requested" | "validating" | "running" | "passed" | "failed";
+export type RunStatus = "requested" | "validating" | "running" | "passed" | "failed" | "cancelled";
 export type StepStatus = "passed" | "failed";
 
 export interface ScenarioSummary {

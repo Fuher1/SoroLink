@@ -5,7 +5,9 @@ import type { LedgerExecution, LedgerExecutionOptions, LedgerGateway, Scenario }
 import type { AppConfig } from "../src/config.js";
 import { SafeRunError } from "../src/errors.js";
 import { DatabaseUnavailableError } from "../src/database.js";
-import type { RunLifecycleLog } from "../src/run-service.js";
+import { RunService, type RunLifecycleLog } from "../src/run-service.js";
+import { InMemoryRunStore } from "../src/run-store.js";
+import { createScenarioRegistry } from "../src/scenarios.js";
 import { completeScenario } from "./fixtures.js";
 
 const config: AppConfig = {
@@ -86,6 +88,7 @@ describe("SoroLink API", () => {
     expect([...response.body.matchAll(/\{([^}]+)\}/g)].map((match) => match[1])).toEqual([
       'outcome="passed"',
       'outcome="failed"',
+      'outcome="cancelled"',
       'reason="capacity"',
       'reason="draining"',
     ]);
@@ -626,6 +629,59 @@ describe("SoroLink API", () => {
         const response = await app.inject({ method: "GET", url });
         expect(response.statusCode).toBe(503);
       }
+    });
+  });
+
+  // ── Issue #40: run cancellation endpoint ─────────────────────────────────
+  describe("run cancellation", () => {
+    it("transitions an active run to cancelled and returns 200 with the final report", async () => {
+      let release!: (value: LedgerExecution) => void;
+      const blockedLedger: LedgerGateway = {
+        execute: vi.fn(() => new Promise<LedgerExecution>((resolve) => { release = resolve; })),
+      };
+      const app = createApp({ ledger: blockedLedger });
+      const started = await app.inject({ method: "POST", url: "/api/v1/runs", payload: { scenarioId: "xlm-payment" } });
+      expect(started.statusCode).toBe(202);
+      const id = started.json().id as string;
+      await vi.waitFor(() => expect(blockedLedger.execute).toHaveBeenCalled());
+
+      const cancelled = await app.inject({ method: "DELETE", url: `/api/v1/runs/${id}` });
+      expect(cancelled.statusCode).toBe(200);
+      expect(cancelled.json().status).toBe("cancelled");
+      expect(cancelled.json().error).toMatchObject({ code: "RUN_CANCELLED", retryable: false });
+      expect(cancelled.json().id).toBe(id);
+
+      const report = await app.inject({ method: "GET", url: `/api/v1/runs/${id}` });
+      expect(report.json().status).toBe("cancelled");
+      release({ steps: [], assertions: [] });
+    });
+
+    it("returns 409 RUN_ALREADY_TERMINAL when cancelling a terminal run", async () => {
+      const app = createApp();
+      const started = await app.inject({ method: "POST", url: "/api/v1/runs", payload: { scenarioId: "xlm-payment" } });
+      const id = started.json().id as string;
+      await vi.waitFor(async () => {
+        const r = await app.inject({ method: "GET", url: `/api/v1/runs/${id}` });
+        expect(r.json().status).toBe("passed");
+      });
+      const response = await app.inject({ method: "DELETE", url: `/api/v1/runs/${id}` });
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error.code).toBe("RUN_ALREADY_TERMINAL");
+    });
+
+    it("returns 404 for a non-existent run ID", async () => {
+      const app = createApp();
+      const response = await app.inject({ method: "DELETE", url: "/api/v1/runs/00000000-0000-0000-0000-000000000000" });
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.code).toBe("RUN_NOT_FOUND");
+    });
+
+    it("exposes the DELETE /api/v1/runs/{runId} operation in the OpenAPI document", async () => {
+      const response = await createApp().inject({ method: "GET", url: "/openapi.json" });
+      expect(response.statusCode).toBe(200);
+      const doc = response.json();
+      expect(doc.paths["/api/v1/runs/{runId}"].delete).toBeDefined();
+      expect(doc.paths["/api/v1/runs/{runId}"].delete.operationId).toBe("cancelRun");
     });
   });
 });

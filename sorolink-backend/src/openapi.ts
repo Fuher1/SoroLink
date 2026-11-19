@@ -155,6 +155,22 @@ export function openApiDocument() {
             "404": { description: "Not found", ...apiErrorContent },
           },
         },
+        delete: {
+          operationId: "cancelRun",
+          summary: "Cancel an active run",
+          description: [
+            "Transitions an active run (requested, validating, or running) to the cancelled terminal state.",
+            "Returns 409 RUN_ALREADY_TERMINAL when the run is already in a terminal state (passed, failed, or cancelled).",
+            "Returns 404 when the run does not exist.",
+            "Cancellation signals the runner to stop after the current step completes; mid-step interruption is out of scope.",
+          ].join(" "),
+          parameters: [{ name: "runId", in: "path", required: true, schema: { type: "string", format: "uuid" } }],
+          responses: {
+            "200": { description: "Run successfully cancelled; returns the final run report with status=cancelled." },
+            "404": { description: "RUN_NOT_FOUND — run does not exist" },
+            "409": { description: "RUN_ALREADY_TERMINAL — run is already in a terminal state" },
+          },
+        },
       },
       "/api/v1/runs/{runId}/report": {
         get: {

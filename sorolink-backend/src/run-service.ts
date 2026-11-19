@@ -18,6 +18,7 @@ const SAFE_RUN_ERROR_CODES = new Set([
   "INTERNAL_ERROR",
   "NETWORK_UNAVAILABLE",
   "RUNNER_AT_CAPACITY",
+  "RUN_CANCELLED",
   "RUN_TIMEOUT",
   "SERVER_SHUTDOWN",
   "STEP_TIMEOUT",
@@ -26,7 +27,7 @@ const SAFE_RUN_ERROR_CODES = new Set([
 
 export interface RunMetricsSnapshot {
   activeRuns: number;
-  terminalRuns: { passed: number; failed: number };
+  terminalRuns: { passed: number; failed: number; cancelled: number };
   rejectedStarts: { capacity: number; draining: number };
   runDuration: { count: number; totalMilliseconds: number };
 }
@@ -52,10 +53,13 @@ export class RunService {
   readonly #activePromises = new Set<Promise<void>>();
   #passedRuns = 0;
   #failedRuns = 0;
+  #cancelledRuns = 0;
   #capacityRejectedStarts = 0;
   #drainingRejectedStarts = 0;
   #runDurationCount = 0;
   #runDurationTotalMilliseconds = 0;
+  /** AbortControllers keyed by run ID, present only while a run is active. */
+  readonly #cancelControllers = new Map<string, AbortController>();
 
   constructor(
     private readonly store: RunStore,
@@ -73,7 +77,7 @@ export class RunService {
   getMetrics(): RunMetricsSnapshot {
     return {
       activeRuns: this.#activeRuns,
-      terminalRuns: { passed: this.#passedRuns, failed: this.#failedRuns },
+      terminalRuns: { passed: this.#passedRuns, failed: this.#failedRuns, cancelled: this.#cancelledRuns },
       rejectedStarts: { capacity: this.#capacityRejectedStarts, draining: this.#drainingRejectedStarts },
       runDuration: { count: this.#runDurationCount, totalMilliseconds: this.#runDurationTotalMilliseconds },
     };
@@ -146,10 +150,44 @@ export class RunService {
     return Promise.resolve(this.store.get(id));
   }
 
+  /**
+   * Cancel an active run by ID.
+   *
+   * - If the run does not exist, throws RunNotFoundError → 404.
+   * - If the run is already in a terminal state, throws RunAlreadyTerminalError → 409.
+   * - Otherwise, marks the run cancelled in the store immediately and signals
+   *   the in-flight AbortController so the runner stops after the current step.
+   */
+  async cancel(id: string): Promise<RunReport> {
+    const run = await this.store.get(id);
+    if (!run) throw new RunNotFoundError(id);
+    const terminalStatuses: Array<typeof run.status> = ["passed", "failed", "cancelled"];
+    if (terminalStatuses.includes(run.status)) throw new RunAlreadyTerminalError(id, run.status);
+
+    // Mark cancelled in the store now so subsequent GETs reflect the cancellation
+    // even before the in-flight execution has fully unwound.
+    const cancelled = await this.store.update(id, {
+      status: "cancelled",
+      completedAt: new Date(this.now()).toISOString(),
+      error: {
+        code: "RUN_CANCELLED",
+        message: "The run was cancelled by request.",
+        category: "internal" as const,
+        retryable: false,
+      },
+    });
+
+    // Signal the runner's AbortController if it's still active.
+    this.#cancelControllers.get(id)?.abort();
+
+    return cancelled;
+  }
+
   async execute(id: string, scenario: ValidatedScenario, startedAt = this.now(), requestId?: string): Promise<void> {
     const controller = new AbortController();
+    this.#cancelControllers.set(id, controller);
     let progressUpdates = Promise.resolve();
-    let outcome: "passed" | "failed" = "failed";
+    let outcome: "passed" | "failed" | "cancelled" = "failed";
     let errorCode: string | undefined;
     try {
       await this.store.update(id, { status: "validating" });
@@ -162,7 +200,7 @@ export class RunService {
         onStep: (step) => {
           progressUpdates = progressUpdates.then(async () => {
             const current = await this.store.get(id);
-            if (!current || current.status === "passed" || current.status === "failed") return;
+            if (!current || current.status === "passed" || current.status === "failed" || current.status === "cancelled") return;
             const steps = [...current.steps, step];
             await this.store.update(id, { steps, summary: summarize(steps, current.assertions) });
           });
@@ -170,7 +208,7 @@ export class RunService {
         onAssertion: (assertion) => {
           progressUpdates = progressUpdates.then(async () => {
             const current = await this.store.get(id);
-            if (!current || current.status === "passed" || current.status === "failed") return;
+            if (!current || current.status === "passed" || current.status === "failed" || current.status === "cancelled") return;
             const assertions = [...current.assertions, assertion];
             await this.store.update(id, { assertions, summary: summarize(current.steps, assertions) });
           });
@@ -184,6 +222,14 @@ export class RunService {
         () => controller.abort(),
       );
       await progressUpdates;
+
+      // Check if the run was cancelled while we were executing.
+      const currentRun = await this.store.get(id);
+      if (currentRun?.status === "cancelled") {
+        outcome = "cancelled";
+        return;
+      }
+
       const summary = summarize(result.steps, result.assertions);
       const passed = summary.stepsFailed === 0 && summary.assertionsFailed === 0;
       errorCode = passed ? undefined : "ASSERTION_FAILED";
@@ -205,9 +251,16 @@ export class RunService {
       outcome = passed ? "passed" : "failed";
     } catch (error) {
       await progressUpdates;
-      const current = await this.store.get(id);
-      const steps = current?.steps ?? [];
-      const assertions = current?.assertions ?? [];
+
+      // Check if a cancellation already set the terminal state.
+      const currentRun = await this.store.get(id);
+      if (currentRun?.status === "cancelled") {
+        outcome = "cancelled";
+        return;
+      }
+
+      const steps = currentRun?.steps ?? [];
+      const assertions = currentRun?.assertions ?? [];
       const normalizedError = normalizeError(error);
       errorCode = SAFE_RUN_ERROR_CODES.has(normalizedError.code) || isStableStellarErrorCode(normalizedError.code)
         ? normalizedError.code
@@ -221,9 +274,11 @@ export class RunService {
         error: normalizedError,
       });
     } finally {
+      this.#cancelControllers.delete(id);
       controller.abort();
       this.#activeRuns -= 1;
       if (outcome === "passed") this.#passedRuns += 1;
+      else if (outcome === "cancelled") this.#cancelledRuns += 1;
       else this.#failedRuns += 1;
       const durationMs = Math.max(0, this.now() - startedAt);
       this.#runDurationCount += 1;

@@ -121,7 +121,7 @@ describe("RunService", () => {
 
     expect(service.getMetrics()).toEqual({
       activeRuns: 0,
-      terminalRuns: { passed: 1, failed: 0 },
+      terminalRuns: { passed: 1, failed: 0, cancelled: 0 },
       rejectedStarts: { capacity: 1, draining: 0 },
       runDuration: { count: 1, totalMilliseconds: 600 },
     });

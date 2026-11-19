@@ -18,9 +18,8 @@ export async function closeAfterDrain(app: { close: () => Promise<void>; runs: P
 }
 import type { AppConfig } from "./config.js";
 import type { LedgerGateway, RunReport, ValidatedScenario } from "./domain.js";
-import { RunCapacityError } from "./errors.js";
-import { DatabaseUnavailableError } from "./database.js";
-import { openApiDocument } from "./openapi.js";
+import { RunCapacityError, RunAlreadyTerminalError, RunNotFoundError } from "./errors.js";
+import { DatabaseUnavailableError } from "./database.js";import { openApiDocument } from "./openapi.js";
 import { FixedWindowRateLimiter } from "./rate-limiter.js";
 import { RunService, type RunLifecycleLogger } from "./run-service.js";
 import { InMemoryRunStore } from "./run-store.js";
@@ -127,7 +126,6 @@ export function buildApp(options: BuildAppOptions): AppInstance {
   const ledger = options.ledger ?? new StellarTestnetGateway(options.config.horizonUrl, options.config.friendbotUrl, {
     fundingConcurrency: options.config.maxConcurrentFriendbotRequests,
   });
-  const clock = options.clock ?? Date.now;
   const runs = new RunService(persistence.runStore ?? new InMemoryRunStore(options.config.maxStoredRuns, options.config.runRetentionMs, clock), ledger, {
     maxConcurrentRuns: options.config.maxConcurrentRuns, runTimeoutMs: options.config.runTimeoutMs, stepTimeoutMs: options.config.stepTimeoutMs,
   }, clock, options.runLogger ?? app.log);
@@ -144,6 +142,7 @@ export function buildApp(options: BuildAppOptions): AppInstance {
         "# TYPE sorolink_terminal_runs_total counter",
         `sorolink_terminal_runs_total{outcome="passed"} ${metrics.terminalRuns.passed}`,
         `sorolink_terminal_runs_total{outcome="failed"} ${metrics.terminalRuns.failed}`,
+        `sorolink_terminal_runs_total{outcome="cancelled"} ${metrics.terminalRuns.cancelled}`,
         "# HELP sorolink_rejected_run_starts_total Rejected starts by fixed reason.",
         "# TYPE sorolink_rejected_run_starts_total counter",
         `sorolink_rejected_run_starts_total{reason="capacity"} ${metrics.rejectedStarts.capacity}`,
@@ -308,9 +307,21 @@ export function buildApp(options: BuildAppOptions): AppInstance {
   app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId/report", async (request, reply) => {
     const run = await runs.get(request.params.runId);
     if (!run) return reply.code(404).send(apiError("RUN_NOT_FOUND", "The requested run does not exist.", request.id));
-    if (run.status !== "passed" && run.status !== "failed") return reply.code(409).send(apiError("RUN_NOT_COMPLETE", "The requested run is not complete.", request.id));
+    if (run.status !== "passed" && run.status !== "failed" && run.status !== "cancelled") return reply.code(409).send(apiError("RUN_NOT_COMPLETE", "The requested run is not complete.", request.id));
     reply.header("content-disposition", `attachment; filename=sorolink-run-${run.id}.json`);
     return sendConditionalRunReport(request, reply, withRetentionMetadata(run, options.config.runRetentionMs));
+  });
+
+  // ── Issue #40: run cancellation endpoint ──────────────────────────────────
+  app.delete<{ Params: { runId: string } }>("/api/v1/runs/:runId", async (request, reply) => {
+    try {
+      const cancelled = await runs.cancel(request.params.runId);
+      return reply.code(200).send(withRetentionMetadata(cancelled, options.config.runRetentionMs));
+    } catch (error) {
+      if (error instanceof RunNotFoundError) return reply.code(404).send(apiError("RUN_NOT_FOUND", "The requested run does not exist.", request.id));
+      if (error instanceof RunAlreadyTerminalError) return reply.code(409).send(apiError("RUN_ALREADY_TERMINAL", `Run is already in terminal state: ${error.status}.`, request.id));
+      throw error;
+    }
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -417,7 +428,7 @@ function parseBoundedInt(value: string, minimum: number, maximum: number): numbe
  * upper bound, not a guarantee.
  */
 function withRetentionMetadata<T extends RunReport>(run: T, retentionMs: number): T & { expiresAt?: string } {
-  if ((run.status !== "passed" && run.status !== "failed") || !run.completedAt) return run;
+  if ((run.status !== "passed" && run.status !== "failed" && run.status !== "cancelled") || !run.completedAt) return run;
   const expiresAt = new Date(Date.parse(run.completedAt) + retentionMs).toISOString();
   return { ...run, expiresAt };
 }

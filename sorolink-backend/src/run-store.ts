@@ -221,7 +221,7 @@ export class PostgresRunStore implements RunStore {
  * cutoff, and past the `guard_run_cleanup` 30-day floor (migration 001), which
  * would otherwise reject the DELETE mid-transaction.
  */
-const expiredRunPredicate = `status IN ('passed', 'failed')
+const expiredRunPredicate = `status IN ('passed', 'failed', 'cancelled')
       AND completed_at IS NOT NULL
       AND completed_at <= clock_timestamp() - ($1 * interval '1 millisecond')
       AND completed_at < clock_timestamp() - interval '30 days'`;
@@ -339,5 +339,5 @@ function redactAccountMaterial(value: string): string {
 }
 
 function isTerminal(run: RunReport): boolean {
-  return run.status === "passed" || run.status === "failed";
+  return run.status === "passed" || run.status === "failed" || run.status === "cancelled";
 }

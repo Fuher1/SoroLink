@@ -89,6 +89,20 @@ export class ShutdownError extends SafeRunError {
   }
 }
 
+export class RunAlreadyTerminalError extends Error {
+  constructor(readonly runId: string, readonly status: string) {
+    super(`Run ${runId} is already terminal with status ${status}.`);
+    this.name = "RunAlreadyTerminalError";
+  }
+}
+
+export class RunNotFoundError extends Error {
+  constructor(readonly runId: string) {
+    super(`Run ${runId} does not exist.`);
+    this.name = "RunNotFoundError";
+  }
+}
+
 export async function withTimeout<T>(
   task: Promise<T>,
   timeoutMs: number,

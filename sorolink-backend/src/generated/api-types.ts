@@ -19,6 +19,8 @@ export interface ApiOperations {
   startDefinitionRun: { body: ScenarioDefinition | string; headers?: { "idempotency-key"?: string }; response: RunReport };
   getRun: { params: { runId: string }; response: RunReport };
   downloadRunReport: { params: { runId: string }; response: RunReport };
+  /** Issue #40 — transitions an active run to the cancelled terminal state. */
+  cancelRun: { params: { runId: string }; response: RunReport };
 }
 
 export type ApiOperationId = keyof ApiOperations;

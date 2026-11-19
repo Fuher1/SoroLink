@@ -27,7 +27,7 @@ export const runReportSchemaV1 = {
     scenarioSchemaVersion: { const: 1 },
     scenarioContentHash: { type: "string", minLength: 1 },
     network: { const: "testnet" },
-    status: { enum: ["requested", "validating", "running", "passed", "failed"] },
+    status: { enum: ["requested", "validating", "running", "passed", "failed", "cancelled"] },
     createdAt: { type: "string", minLength: 1 },
     completedAt: { type: "string", minLength: 1 },
     expiresAt: { type: "string", minLength: 1 },
