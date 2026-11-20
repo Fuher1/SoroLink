@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { ApiError, RateLimitError, downloadReport, getRun, getScenario, listScenarios, startRun, type JsonValue, type RunReport, type ScenarioDetail, type ScenarioSummary } from "@/lib/api";
 
-const terminalStatuses = new Set(["passed", "failed"]);
+const terminalStatuses = new Set(["passed", "failed", "cancelled"]);
 
 export type ScenarioFilter = "all" | "xlm" | "issued-asset" | "expected-failure";
 export type SortOrder = "name-asc" | "name-desc" | "id-asc";
@@ -138,7 +138,6 @@ export function Dashboard() {
   const [scenarios, setScenarios] = useState<ScenarioSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
   const [run, setRun] = useState<RunReport | null>(null);
-  const [reportFilter, setReportFilter] = useState<ReportFilter>("all");
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -304,7 +303,11 @@ export function Dashboard() {
       .catch((reason: unknown) => {
         if (!active) return;
         if (reason instanceof DOMException && reason.name === "AbortError") return;
-        setRestorationError(readError(reason));
+        if (reason instanceof ApiError && (reason.status === 404 || reason.code === "RUN_NOT_FOUND")) {
+          setRestorationError("Run not found");
+        } else {
+          setRestorationError(readError(reason));
+        }
       })
       .finally(() => {
         if (active) setRestoringRun(false);
@@ -825,21 +828,19 @@ export function Dashboard() {
             </div>
           ) : (
             filteredScenarios.map((scenario, index) => (
+              // #30 (WCAG 4.1.2, axe nested-interactive): the card is no longer a
+              // role="button" wrapping other buttons. Keyboard and assistive-tech
+              // users select through the inner "scenario-select" button, which
+              // exposes the selected state; the card-level click (which that
+              // button's click bubbles to) is a pointer convenience only.
+              // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
               <div
-                role="button"
-                tabIndex={0}
                 className={`scenario-card ${selectedId === scenario.id ? "selected" : ""}`}
                 key={scenario.id}
                 id={`scenario-card-${scenario.id}`}
                 onClick={() => setSelectedId(scenario.id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setSelectedId(scenario.id);
-                  }
-                }}
               >
-                <span className="card-index">0{index + 1}</span>
+                <span className="card-index" aria-hidden="true">0{index + 1}</span>
                 <ScenarioIcon kind={scenario.id} />
                 <span className="scenario-name">{scenario.name}</span>
                 <span className="scenario-description">{scenario.description}</span>
@@ -971,13 +972,13 @@ export function Dashboard() {
               </button>
             </div>
             {viewMode === "report" && (
-              <label className="print-button" style={{ cursor: "pointer", display: "inline-flex", alignItems: "center" }}>
+              <label className="print-button file-picker" style={{ cursor: "pointer", display: "inline-flex", alignItems: "center" }}>
                 Import offline report
                 <input
                   type="file"
                   accept=".json,application/json"
                   data-testid="offline-report-input"
-                  style={{ display: "none" }}
+                  className="sr-only"
                   onChange={handleImportReport}
                 />
               </label>
@@ -1062,7 +1063,7 @@ export function Dashboard() {
           ) : restorationError ? (
             <div className="empty-report">
               <div className="empty-glyph"><WarningIcon /></div>
-              <strong>Run unavailable</strong>
+              <strong>Run not found</strong>
               <p>{restorationError}</p>
               <button type="button" className="run-button run-button--secondary" style={{ marginTop: '16px', minWidth: 'auto', padding: '10px 16px' }} onClick={clearRestoration}>Dismiss</button>
             </div>
@@ -1072,9 +1073,9 @@ export function Dashboard() {
         ) : (
           <RunView
             run={run}
-            isOffline={isOffline}
             reportFilter={reportFilter}
             scenarioName={scenarios.find((scenario) => scenario.id === run.scenarioId)?.name ?? run.scenarioId}
+            onCancelled={setRun}
           />
         )}
       </section>
@@ -1084,11 +1085,13 @@ export function Dashboard() {
   );
 }
 
-function RunView({ run, reportFilter, scenarioName }: { run: RunReport; reportFilter: ReportFilter; scenarioName: string }) {
+function RunView({ run, reportFilter, scenarioName, onCancelled }: { run: RunReport; reportFilter: ReportFilter; scenarioName: string; onCancelled?: (run: RunReport) => void }) {
   const isTerminal = terminalStatuses.has(run.status);
   const [now, setNow] = useState(() => Date.now());
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isTerminal) return;
@@ -1147,6 +1150,20 @@ function RunView({ run, reportFilter, scenarioName }: { run: RunReport; reportFi
     }
   };
 
+  const handleCancel = async () => {
+    if (cancelling || isTerminal) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      const cancelled = await cancelRun(run.id);
+      onCancelled?.(cancelled);
+    } catch (reason: unknown) {
+      setCancelError(readError(reason));
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   const visibleSteps = run.steps
     .map((step, index) => ({ step, index }))
     .filter(({ step }) => reportFilter === "all" || step.status === "failed");
@@ -1182,7 +1199,18 @@ function RunView({ run, reportFilter, scenarioName }: { run: RunReport; reportFi
             Retention is not guaranteed; a report already loaded stays visible here.
           </p>
         )}
-        {!isTerminal && <div className="running-row"><span className="spinner" /><div><strong>{titleCase(run.status)}</strong><span>SoroLink is executing this flow on Stellar Testnet.</span></div></div>}
+        {!isTerminal && (
+          <>
+            <div className="running-row">
+              <span className="spinner" />
+              <div><strong>{titleCase(run.status)}</strong><span>SoroLink is executing this flow on Stellar Testnet.</span></div>
+              <button type="button" className="run-button run-button--secondary cancel-run-button" disabled={cancelling} onClick={handleCancel}>
+                {cancelling ? "Cancelling…" : "Cancel"}
+              </button>
+            </div>
+            {cancelError && <div className="error-banner" role="alert"><WarningIcon /><div><strong>Could not cancel run</strong><span>{cancelError}</span></div></div>}
+          </>
+        )}
         {reportFilter === "failed" && visibleSteps.length === 0 && visibleAssertions.length === 0 && (
           <div className="empty-checks" role="status">
             <strong>No failed checks</strong>
@@ -1211,7 +1239,7 @@ function RunView({ run, reportFilter, scenarioName }: { run: RunReport; reportFi
                 </div>
               )}
             </div>
-            {step.ledger && <code className="ledger">L#{step.ledger}</code>}
+            <StepMeta step={step} />
           </div>
         ))}
         {run.assertions.map((assertion, index) => (
@@ -1339,9 +1367,9 @@ function ReportComparisonView({ currentRun }: { currentRun: RunReport | null }) 
         <div className="comparison-input-card" style={{ border: "1px solid var(--line)", padding: "16px", background: "#f8f6f0" }}>
           <span className="label">REPORT A (BASE)</span>
           <div style={{ margin: "10px 0", display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            <label className="run-button run-button--secondary" style={{ padding: "8px 14px", minWidth: "auto", cursor: "pointer", display: "inline-block" }}>
+            <label className="run-button run-button--secondary file-picker" style={{ padding: "8px 14px", minWidth: "auto", cursor: "pointer", display: "inline-block" }}>
               Choose Report A JSON
-              <input type="file" accept=".json,application/json" data-testid="compare-file-a" onChange={handleFileA} style={{ display: "none" }} />
+              <input type="file" accept=".json,application/json" data-testid="compare-file-a" onChange={handleFileA} className="sr-only" />
             </label>
             {currentRun && (
               <button
@@ -1365,9 +1393,9 @@ function ReportComparisonView({ currentRun }: { currentRun: RunReport | null }) 
         <div className="comparison-input-card" style={{ border: "1px solid var(--line)", padding: "16px", background: "#f8f6f0" }}>
           <span className="label">REPORT B (COMPARISON)</span>
           <div style={{ margin: "10px 0", display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            <label className="run-button run-button--secondary" style={{ padding: "8px 14px", minWidth: "auto", cursor: "pointer", display: "inline-block" }}>
+            <label className="run-button run-button--secondary file-picker" style={{ padding: "8px 14px", minWidth: "auto", cursor: "pointer", display: "inline-block" }}>
               Choose Report B JSON
-              <input type="file" accept=".json,application/json" data-testid="compare-file-b" onChange={handleFileB} style={{ display: "none" }} />
+              <input type="file" accept=".json,application/json" data-testid="compare-file-b" onChange={handleFileB} className="sr-only" />
             </label>
             {currentRun && (
               <button
@@ -1591,23 +1619,25 @@ function StatusBadge({ status }: { status: RunReport["status"] }) {
 }
 
 function ScenarioIcon({ kind }: { kind: string }) {
-  if (kind === "xlm-payment") return <svg className="scenario-icon" viewBox="0 0 40 40" fill="none"><circle cx="20" cy="20" r="13"/><path d="m13 24 16-9M12 19l16-9M14 30l14-8"/></svg>;
-  if (kind === "issued-asset-payment") return <svg className="scenario-icon" viewBox="0 0 40 40" fill="none"><rect x="7" y="10" width="20" height="20" rx="3"/><path d="M13 16h8M13 21h8M13 26h5M30 15v12M26 23l4 4 4-4"/></svg>;
-  return <svg className="scenario-icon" viewBox="0 0 40 40" fill="none"><path d="M20 6 35 33H5L20 6Z"/><path d="M20 15v9M20 28v1"/></svg>;
+  if (kind === "xlm-payment") return <svg className="scenario-icon" viewBox="0 0 40 40" fill="none" aria-hidden="true" focusable="false"><circle cx="20" cy="20" r="13"/><path d="m13 24 16-9M12 19l16-9M14 30l14-8"/></svg>;
+  if (kind === "issued-asset-payment") return <svg className="scenario-icon" viewBox="0 0 40 40" fill="none" aria-hidden="true" focusable="false"><rect x="7" y="10" width="20" height="20" rx="3"/><path d="M13 16h8M13 21h8M13 26h5M30 15v12M26 23l4 4 4-4"/></svg>;
+  return <svg className="scenario-icon" viewBox="0 0 40 40" fill="none" aria-hidden="true" focusable="false"><path d="M20 6 35 33H5L20 6Z"/><path d="M20 15v9M20 28v1"/></svg>;
 }
 
-function PlayIcon() { return <svg viewBox="0 0 20 20" fill="none"><path d="m7 5 7 5-7 5V5Z"/></svg>; }
-function ArrowIcon() { return <svg viewBox="0 0 16 16" fill="none"><path d="M3 13 13 3M6 3h7v7"/></svg>; }
-function DownloadIcon() { return <svg viewBox="0 0 20 20" fill="none"><path d="M10 3v10M6 9l4 4 4-4M4 17h12"/></svg>; }
-function CheckIcon() { return <svg viewBox="0 0 16 16" fill="none"><path d="m3 8 3 3 7-7"/></svg>; }
-function WarningIcon() { return <svg viewBox="0 0 20 20" fill="none"><path d="M10 3 18 17H2L10 3ZM10 8v4M10 15v.1"/></svg>; }
-function SearchIcon() { return <svg className="search-icon" viewBox="0 0 20 20" fill="none"><circle cx="8.5" cy="8.5" r="5"/><path d="m12.5 12.5 4 4"/></svg>; }
+function PlayIcon() { return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="m7 5 7 5-7 5V5Z"/></svg>; }
+function ArrowIcon() { return <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M3 13 13 3M6 3h7v7"/></svg>; }
+function DownloadIcon() { return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="M10 3v10M6 9l4 4 4-4M4 17h12"/></svg>; }
+function CheckIcon() { return <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="m3 8 3 3 7-7"/></svg>; }
+function WarningIcon() { return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="M10 3 18 17H2L10 3ZM10 8v4M10 15v.1"/></svg>; }
+function SearchIcon() { return <svg className="search-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="5"/><path d="m12.5 12.5 4 4"/></svg>; }
 function ChevronIcon({ rotated }: { rotated?: boolean } = {}) {
   return (
     <svg
       className={`chevron-icon${rotated ? " chevron-icon--up" : ""}`}
       viewBox="0 0 16 16"
       fill="none"
+      aria-hidden="true"
+      focusable="false"
     >
       <path d="M4 6l4 4 4-4" />
     </svg>
@@ -1642,6 +1672,30 @@ export function formatElapsed(startIso: string, nowMs: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return `${minutes}m ${remainingSeconds}s`;
+}
+
+/**
+ * Issue #28: formats a step's elapsed time with one decimal place, e.g.
+ * "1.2 s". Returns null when the report carries no usable timing evidence.
+ */
+export function formatStepDuration(durationMs: unknown): string | null {
+  if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) return null;
+  return `${(durationMs / 1000).toFixed(1)} s`;
+}
+
+function StepMeta({ step }: { step: StepResult }) {
+  const elapsed = formatStepDuration(step.durationMs);
+  if (!step.ledger && !elapsed) return null;
+  return (
+    <div className="step-meta">
+      {step.ledger && <code className="ledger">L#{step.ledger}</code>}
+      {elapsed && (
+        <code className="step-elapsed" data-testid={`step-elapsed-${step.id}`} title="Step elapsed time">
+          <span className="sr-only">Elapsed time: </span>{elapsed}
+        </code>
+      )}
+    </div>
+  );
 }
 
 export function computeDuration(startIso: string, endIso: string): string {

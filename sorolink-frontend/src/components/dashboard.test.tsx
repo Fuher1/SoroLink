@@ -364,6 +364,69 @@ describe("Dashboard report filtering", () => {
   });
 });
 
+describe("Dashboard step elapsed time (#28)", () => {
+  const timedRun: RunReport = {
+    ...mockRun,
+    status: "passed",
+    steps: [
+      { id: "fund-accounts", type: "fundAccounts", status: "passed", message: "FUNDED MESSAGE", durationMs: 1_234 },
+      { id: "send-payment", type: "payment", status: "passed", message: "PAYMENT MESSAGE", ledger: 42, durationMs: 50 },
+      { id: "legacy-step", type: "payment", status: "passed", message: "LEGACY MESSAGE" },
+    ],
+    summary: { stepsPassed: 3, stepsFailed: 0, assertionsPassed: 0, assertionsFailed: 0 },
+  };
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockSearchParams = new URLSearchParams("?runId=run-123");
+    vi.spyOn(api, "listScenarios").mockResolvedValue(mockScenarios);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    mockSearchParams = new URLSearchParams();
+  });
+
+  it("formats step durations in seconds with one decimal place", () => {
+    expect(formatStepDuration(1_234)).toBe("1.2 s");
+    expect(formatStepDuration(1_250)).toBe("1.3 s");
+    expect(formatStepDuration(50)).toBe("0.1 s");
+    expect(formatStepDuration(0)).toBe("0.0 s");
+    expect(formatStepDuration(65_000)).toBe("65.0 s");
+  });
+
+  it("returns null for missing or malformed durations", () => {
+    expect(formatStepDuration(undefined)).toBeNull();
+    expect(formatStepDuration(-1)).toBeNull();
+    expect(formatStepDuration(Number.NaN)).toBeNull();
+    expect(formatStepDuration("1200")).toBeNull();
+  });
+
+  it("shows each step's elapsed time in its report row", async () => {
+    vi.spyOn(api, "getRun").mockResolvedValue(timedRun);
+
+    render(<Dashboard />);
+    await screen.findByText("FUNDED MESSAGE");
+
+    const fundRow = screen.getByText("FUNDED MESSAGE").closest(".report-row") as HTMLElement;
+    const paymentRow = screen.getByText("PAYMENT MESSAGE").closest(".report-row") as HTMLElement;
+    expect(within(fundRow).getByTestId("step-elapsed-fund-accounts")).toHaveTextContent("1.2 s");
+    expect(within(paymentRow).getByTestId("step-elapsed-send-payment")).toHaveTextContent("0.1 s");
+    expect(within(paymentRow).getByText("L#42")).toBeDefined();
+  });
+
+  it("omits elapsed time for steps from older reports without timing", async () => {
+    vi.spyOn(api, "getRun").mockResolvedValue(timedRun);
+
+    render(<Dashboard />);
+    await screen.findByText("LEGACY MESSAGE");
+
+    const legacyRow = screen.getByText("LEGACY MESSAGE").closest(".report-row") as HTMLElement;
+    expect(within(legacyRow).queryByTestId("step-elapsed-legacy-step")).toBeNull();
+  });
+});
+
 describe("Dashboard component catalogue loading and retry", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -490,6 +553,39 @@ describe("Dashboard URL Restoration", () => {
     expect(startRunMock).not.toHaveBeenCalled(); // Absense of POST request on restore
   });
 
+  it("cancels an in-progress run and disables the cancel action after cancellation", async () => {
+    mockSearchParams = new URLSearchParams("?runId=run-running");
+    const runningRun = { ...mockRun, id: "run-running", status: "running" as const };
+    const cancelledRun = { ...runningRun, status: "cancelled" as const };
+    vi.spyOn(api, "getRun").mockResolvedValue(runningRun);
+    vi.spyOn(api, "cancelRun").mockResolvedValue(cancelledRun);
+
+    render(<Dashboard />);
+
+    const cancelButton = await screen.findByRole("button", { name: "Cancel" });
+    fireEvent.click(cancelButton);
+
+    await waitFor(() => {
+      expect(api.cancelRun).toHaveBeenCalledWith("run-running");
+    });
+    expect(await screen.findByText("Cancelled")).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
+  it("shows an error if cancelling a run fails", async () => {
+    mockSearchParams = new URLSearchParams("?runId=run-running");
+    const runningRun = { ...mockRun, id: "run-running", status: "running" as const };
+    vi.spyOn(api, "getRun").mockResolvedValue(runningRun);
+    vi.spyOn(api, "cancelRun").mockRejectedValue(new Error("Cancellation failed"));
+
+    render(<Dashboard />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByText("Could not cancel run")).toBeDefined();
+    expect(screen.getByText("Cancellation failed")).toBeDefined();
+  });
+
   it("shows unavailable state for missing run", async () => {
     mockSearchParams = new URLSearchParams("?runId=invalid-run");
     const getRunMock = vi.spyOn(api, "getRun").mockRejectedValue(new Error("Not found"));
@@ -497,8 +593,7 @@ describe("Dashboard URL Restoration", () => {
     render(<Dashboard />);
     
     // Should show error state
-    await screen.findByText("Run unavailable");
-    expect(screen.getByText("Not found")).toBeDefined();
+    await screen.findByText("Run not found");
     
     // Clicking dismiss clears URL
     const dismissButton = screen.getByRole("button", { name: /Dismiss/i });

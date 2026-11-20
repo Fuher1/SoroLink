@@ -55,6 +55,23 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  frontend-a11y:
+    name: Frontend accessibility lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sorolink-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install isolated a11y lint toolchain
+        run: npm install --prefix tools/a11y-lint --no-package-lock --no-audit --no-fund
+      - name: Fail on jsx-a11y violations
+        run: npm run lint:a11y
+
   cli:
     name: CLI checks
     runs-on: ubuntu-latest

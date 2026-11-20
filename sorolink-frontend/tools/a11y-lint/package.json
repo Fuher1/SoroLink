@@ -1,0 +1,12 @@
+{
+  "name": "@sorolink/frontend-a11y-lint",
+  "private": true,
+  "description": "Isolated accessibility lint toolchain for the SoroLink dashboard (issue #30). Kept separate so the app's dependency tree and lockfile stay unchanged.",
+  "type": "module",
+  "devDependencies": {
+    "eslint": "9.39.1",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.46.2"
+  }
+}
