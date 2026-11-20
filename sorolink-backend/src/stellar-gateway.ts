@@ -64,6 +64,12 @@ export interface HorizonRetryConfig {
   baseDelayMs?: number;
   maxDelayMs?: number;
   factor?: number;
+  /**
+   * Issue #31: symmetric jitter applied to each nominal backoff delay, as a
+   * fraction of that delay. 0.2 means each delay lands within ±20 % of the
+   * nominal 1 s / 2 s / 4 s schedule.
+   */
+  jitterRatio?: number;
   random?: () => number;
 }
 
@@ -79,6 +85,7 @@ export const DEFAULT_HORIZON_RETRY_CONFIG = {
   baseDelayMs: 1_000,
   maxDelayMs: 4_000,
   factor: 2,
+  jitterRatio: 0.2,
 } as const;
 
 export function calculateRetryDelay(
@@ -93,6 +100,24 @@ export function calculateRetryDelay(
   const exponential = baseDelayMs * Math.pow(factor, Math.max(0, attempt - 1));
   const bounded = Math.min(maxDelayMs, exponential);
   return Math.floor(random() * bounded);
+}
+
+/**
+ * Issue #31: bounded exponential backoff for Horizon calls. Retry `n` (1-based)
+ * waits `baseDelayMs * factor^(n-1)`, capped at `maxDelayMs`, then scaled by a
+ * symmetric jitter of ±`jitterRatio`. With the defaults this yields
+ * 1 s, 2 s and 4 s, each ±20 %. `random() === 0.5` returns the nominal delay.
+ */
+export function calculateHorizonRetryDelay(retry: number, config: HorizonRetryConfig = {}): number {
+  const baseDelayMs = config.baseDelayMs ?? DEFAULT_HORIZON_RETRY_CONFIG.baseDelayMs;
+  const maxDelayMs = config.maxDelayMs ?? DEFAULT_HORIZON_RETRY_CONFIG.maxDelayMs;
+  const factor = config.factor ?? DEFAULT_HORIZON_RETRY_CONFIG.factor;
+  const jitterRatio = Math.min(1, Math.max(0, config.jitterRatio ?? DEFAULT_HORIZON_RETRY_CONFIG.jitterRatio));
+  const random = config.random ?? Math.random;
+
+  const nominal = Math.min(maxDelayMs, baseDelayMs * Math.pow(factor, Math.max(0, retry - 1)));
+  const sample = Math.min(1, Math.max(0, random()));
+  return Math.max(0, Math.round(nominal * (1 + jitterRatio * (2 * sample - 1))));
 }
 
 export function signalSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -542,6 +567,7 @@ export class StellarTestnetGateway implements LedgerGateway {
       baseDelayMs: this.#options.horizonRetry?.baseDelayMs ?? DEFAULT_HORIZON_RETRY_CONFIG.baseDelayMs,
       maxDelayMs: this.#options.horizonRetry?.maxDelayMs ?? DEFAULT_HORIZON_RETRY_CONFIG.maxDelayMs,
       factor: this.#options.horizonRetry?.factor ?? DEFAULT_HORIZON_RETRY_CONFIG.factor,
+      jitterRatio: this.#options.horizonRetry?.jitterRatio ?? DEFAULT_HORIZON_RETRY_CONFIG.jitterRatio,
       random: this.#options.horizonRetry?.random ?? Math.random,
     };
     const sleepFn = this.#options.sleep ?? signalSleep;
@@ -556,16 +582,16 @@ export class StellarTestnetGateway implements LedgerGateway {
           throw error;
         }
         if (retries >= config.maxRetries) {
-          if (isTimeoutError(error)) throw horizonTimeoutError(request);
+          if (isTimeoutError(error)) throw horizonTimeoutError(request, retries);
           throw new SafeRunError({
             code: "HORIZON_UNAVAILABLE",
-            message: `Horizon request failed after ${retries} retries.`,
+            message: `Horizon ${request} failed after ${retries} retries.`,
             category: "network",
             retryable: true,
           });
         }
         retries += 1;
-        const delay = calculateRetryDelay(retries, config);
+        const delay = calculateHorizonRetryDelay(retries, config);
         await sleepFn(delay);
       }
     }
