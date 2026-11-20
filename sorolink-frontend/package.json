@@ -10,6 +10,7 @@
     "test:e2e": "playwright test",
     "test:e2e:prod": "TEST_MODE=production playwright test",
     "typecheck": "tsc --noEmit",
+    "lint:a11y": "tools/a11y-lint/node_modules/.bin/eslint --config tools/a11y-lint/eslint.config.mjs --max-warnings 0 src",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {

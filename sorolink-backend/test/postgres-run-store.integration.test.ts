@@ -86,6 +86,28 @@ const postgresAvailable = process.platform !== "win32" || existsSync("C:/Windows
     expect((await store.get(run.id))?.steps[0]?.message).toContain("[REDACTED]");
   });
 
+  it("round-trips step timing and fee evidence through PostgreSQL", async () => {
+    const run = report({
+      status: "passed",
+      completedAt: new Date().toISOString(),
+      steps: [{
+        id: "pay",
+        type: "payment",
+        status: "passed",
+        message: "Confirmed.",
+        feeCharged: "100",
+        startedAt: "2026-11-20T10:00:00.000Z",
+        completedAt: "2026-11-20T10:00:01.234Z",
+        durationMs: 1_234,
+      }],
+      summary: { stepsPassed: 1, stepsFailed: 0, assertionsPassed: 0, assertionsFailed: 0 },
+    });
+    await store.create(run);
+
+    const reloaded = await new PostgresRunStore(database, 60_000).get(run.id);
+    expect(reloaded?.steps[0]).toEqual(run.steps[0]);
+  });
+
   it("hides completed runs after their retention period", async () => {
     const completedAt = new Date(Date.now() - 120_000).toISOString();
     const run = report({

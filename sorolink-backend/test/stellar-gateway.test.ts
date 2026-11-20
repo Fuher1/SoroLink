@@ -4,6 +4,7 @@ import type { ValidatedScenario } from "../src/domain.js";
 import { createScenarioRegistry } from "../src/scenarios.js";
 import {
   balanceDeltaAssertion,
+  calculateHorizonRetryDelay,
   calculateRetryDelay,
   canonicalDecimal,
   isExpectedMissingTrustlineError,
@@ -387,7 +388,7 @@ describe("StellarTestnetGateway Friendbot bounded retry", () => {
         .mockImplementation(async (publicKey) => mockAccount(publicKey));
       const sleep = vi.fn(async (_ms: number) => {});
       const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", {
-        horizonRetry: { random: () => 1 },
+        horizonRetry: { random: () => 0.5 },
         sleep,
       });
 
@@ -410,7 +411,7 @@ describe("StellarTestnetGateway Friendbot bounded retry", () => {
         .mockResolvedValueOnce({ hash: "transaction-hash", ledger: 123 } as Horizon.HorizonApi.SubmitTransactionResponse);
       const sleep = vi.fn(async (_ms: number) => {});
       const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", {
-        horizonRetry: { random: () => 1 },
+        horizonRetry: { random: () => 0.5 },
         sleep,
       });
       const scenario: ValidatedScenario = {
@@ -437,7 +438,7 @@ describe("StellarTestnetGateway Friendbot bounded retry", () => {
         .mockRejectedValue(horizonResponseError(400));
       const sleep = vi.fn(async (_ms: number) => {});
       const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", {
-        horizonRetry: { random: () => 1 },
+        horizonRetry: { random: () => 0.5 },
         sleep,
       });
 
@@ -451,7 +452,7 @@ describe("StellarTestnetGateway Friendbot bounded retry", () => {
       const loadAccount = vi.spyOn(Horizon.Server.prototype, "loadAccount").mockRejectedValue(timeoutError);
       const sleep = vi.fn(async (_ms: number) => {});
       const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", {
-        horizonRetry: { random: () => 1 },
+        horizonRetry: { random: () => 0.5 },
         sleep,
       });
 
@@ -459,7 +460,7 @@ describe("StellarTestnetGateway Friendbot bounded retry", () => {
         name: "SafeRunError",
         report: {
           code: "HORIZON_UNAVAILABLE",
-          message: "Horizon account loading timed out. This may be a temporary Testnet issue. Try again.",
+          message: "Horizon account loading timed out and failed after 3 retries. This may be a temporary Testnet issue. Try again.",
           category: "network",
           retryable: true,
         },
@@ -500,6 +501,114 @@ describe("StellarTestnetGateway Friendbot bounded retry", () => {
           retryable: true,
           failedStepId: "payment",
         },
+      });
+    });
+
+    describe("issue #31 bounded exponential backoff", () => {
+      const paymentScenario: ValidatedScenario = {
+        ...accountScenario,
+        id: "horizon-submit-backoff",
+        accounts: [
+          { id: "alice", generate: true, fund: false },
+          { id: "bob", generate: true, fund: false },
+        ],
+        steps: [{ id: "payment", type: "payment", from: "alice", to: "bob", asset: "xlm", amount: "1" }],
+        assertions: [],
+      };
+
+      function mockSubmissionPrerequisites(): void {
+        vi.spyOn(Horizon.Server.prototype, "loadAccount").mockImplementation(async (publicKey) => mockAccount(publicKey));
+        vi.spyOn(Horizon.Server.prototype, "fetchTimebounds").mockImplementation(async () => ({
+          minTime: Math.floor(Date.now() / 1_000),
+          maxTime: Math.floor(Date.now() / 1_000) + 60,
+        }));
+      }
+
+      it("uses nominal 1 s, 2 s, 4 s delays bounded by ±20 % jitter", () => {
+        expect([1, 2, 3].map((retry) => calculateHorizonRetryDelay(retry, { random: () => 0.5 }))).toEqual([1_000, 2_000, 4_000]);
+        expect([1, 2, 3].map((retry) => calculateHorizonRetryDelay(retry, { random: () => 0 }))).toEqual([800, 1_600, 3_200]);
+        expect([1, 2, 3].map((retry) => calculateHorizonRetryDelay(retry, { random: () => 1 }))).toEqual([1_200, 2_400, 4_800]);
+        for (let sample = 0; sample <= 1; sample += 0.05) {
+          for (const [retry, nominal] of [[1, 1_000], [2, 2_000], [3, 4_000]] as const) {
+            const delay = calculateHorizonRetryDelay(retry, { random: () => sample });
+            expect(delay).toBeGreaterThanOrEqual(nominal * 0.8);
+            expect(delay).toBeLessThanOrEqual(nominal * 1.2);
+          }
+        }
+      });
+
+      it("waits through the real backoff timers using fake time only", async () => {
+        const loadAccount = vi.spyOn(Horizon.Server.prototype, "loadAccount")
+          .mockRejectedValueOnce(horizonResponseError(429))
+          .mockRejectedValueOnce(horizonResponseError(503))
+          .mockImplementation(async (publicKey) => mockAccount(publicKey));
+        const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", {
+          horizonRetry: { random: () => 0.5 },
+        });
+
+        let settled = false;
+        const execution = gateway.execute(accountScenario).finally(() => { settled = true; });
+
+        await vi.advanceTimersByTimeAsync(999);
+        expect(loadAccount).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(loadAccount).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1_999);
+        expect(loadAccount).toHaveBeenCalledTimes(2);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+
+        const result = await execution;
+        expect(result.assertions[0]).toMatchObject({ type: "accountExists", status: "passed" });
+        expect(loadAccount).toHaveBeenCalledTimes(3);
+      });
+
+      it("retries transaction submission up to three times on 429 and states the retry count", async () => {
+        mockSubmissionPrerequisites();
+        const submitTransaction = vi.spyOn(Horizon.Server.prototype, "submitTransaction")
+          .mockRejectedValue(horizonResponseError(429));
+        const sleep = vi.fn(async (_ms: number) => {});
+        const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", {
+          horizonRetry: { random: () => 0.5 },
+          sleep,
+        });
+
+        await expect(gateway.execute(paymentScenario)).rejects.toMatchObject({
+          report: {
+            code: "HORIZON_UNAVAILABLE",
+            message: expect.stringContaining("failed after 3 retries"),
+            retryable: true,
+          },
+        });
+        expect(submitTransaction).toHaveBeenCalledTimes(4);
+        expect(sleep.mock.calls.map(([delay]) => delay)).toEqual([1_000, 2_000, 4_000]);
+      });
+
+      it("retries account loading up to three times on 503 and states the retry count", async () => {
+        const loadAccount = vi.spyOn(Horizon.Server.prototype, "loadAccount").mockRejectedValue(horizonResponseError(503));
+        const sleep = vi.fn(async (_ms: number) => {});
+        const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", {
+          horizonRetry: { random: () => 0.5 },
+          sleep,
+        });
+
+        await expect(gateway.execute(accountScenario)).rejects.toMatchObject({
+          report: { code: "HORIZON_UNAVAILABLE", message: expect.stringContaining("failed after 3 retries") },
+        });
+        expect(loadAccount).toHaveBeenCalledTimes(4);
+        expect(sleep).toHaveBeenCalledTimes(3);
+      });
+
+      it.each([400, 401, 403, 409])("does not retry transaction submission after HTTP %i", async (status) => {
+        mockSubmissionPrerequisites();
+        const submitTransaction = vi.spyOn(Horizon.Server.prototype, "submitTransaction")
+          .mockRejectedValue(horizonResponseError(status));
+        const sleep = vi.fn(async (_ms: number) => {});
+        const gateway = new StellarTestnetGateway("https://horizon.example", "https://friendbot.example", { sleep });
+
+        await expect(gateway.execute(paymentScenario)).rejects.toMatchObject({ name: "SafeRunError" });
+        expect(submitTransaction).toHaveBeenCalledTimes(1);
+        expect(sleep).not.toHaveBeenCalled();
       });
     });
   });

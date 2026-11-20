@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { Dashboard, filterScenario } from "./dashboard";
+import { Dashboard, filterScenario, formatStepDuration } from "./dashboard";
 import * as api from "@/lib/api";
 import { type RunReport } from "@/lib/api";
 
@@ -361,6 +361,69 @@ describe("Dashboard report filtering", () => {
     fireEvent.click(screen.getByRole("button", { name: "Print report" }));
 
     expect(printMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe("Dashboard step elapsed time (#28)", () => {
+  const timedRun: RunReport = {
+    ...mockRun,
+    status: "passed",
+    steps: [
+      { id: "fund-accounts", type: "fundAccounts", status: "passed", message: "FUNDED MESSAGE", durationMs: 1_234 },
+      { id: "send-payment", type: "payment", status: "passed", message: "PAYMENT MESSAGE", ledger: 42, durationMs: 50 },
+      { id: "legacy-step", type: "payment", status: "passed", message: "LEGACY MESSAGE" },
+    ],
+    summary: { stepsPassed: 3, stepsFailed: 0, assertionsPassed: 0, assertionsFailed: 0 },
+  };
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockSearchParams = new URLSearchParams("?runId=run-123");
+    vi.spyOn(api, "listScenarios").mockResolvedValue(mockScenarios);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    mockSearchParams = new URLSearchParams();
+  });
+
+  it("formats step durations in seconds with one decimal place", () => {
+    expect(formatStepDuration(1_234)).toBe("1.2 s");
+    expect(formatStepDuration(1_250)).toBe("1.3 s");
+    expect(formatStepDuration(50)).toBe("0.1 s");
+    expect(formatStepDuration(0)).toBe("0.0 s");
+    expect(formatStepDuration(65_000)).toBe("65.0 s");
+  });
+
+  it("returns null for missing or malformed durations", () => {
+    expect(formatStepDuration(undefined)).toBeNull();
+    expect(formatStepDuration(-1)).toBeNull();
+    expect(formatStepDuration(Number.NaN)).toBeNull();
+    expect(formatStepDuration("1200")).toBeNull();
+  });
+
+  it("shows each step's elapsed time in its report row", async () => {
+    vi.spyOn(api, "getRun").mockResolvedValue(timedRun);
+
+    render(<Dashboard />);
+    await screen.findByText("FUNDED MESSAGE");
+
+    const fundRow = screen.getByText("FUNDED MESSAGE").closest(".report-row") as HTMLElement;
+    const paymentRow = screen.getByText("PAYMENT MESSAGE").closest(".report-row") as HTMLElement;
+    expect(within(fundRow).getByTestId("step-elapsed-fund-accounts")).toHaveTextContent("1.2 s");
+    expect(within(paymentRow).getByTestId("step-elapsed-send-payment")).toHaveTextContent("0.1 s");
+    expect(within(paymentRow).getByText("L#42")).toBeDefined();
+  });
+
+  it("omits elapsed time for steps from older reports without timing", async () => {
+    vi.spyOn(api, "getRun").mockResolvedValue(timedRun);
+
+    render(<Dashboard />);
+    await screen.findByText("LEGACY MESSAGE");
+
+    const legacyRow = screen.getByText("LEGACY MESSAGE").closest(".report-row") as HTMLElement;
+    expect(within(legacyRow).queryByTestId("step-elapsed-legacy-step")).toBeNull();
   });
 });
 

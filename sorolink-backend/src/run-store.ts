@@ -286,6 +286,12 @@ function sanitizeRunReport(run: RunReport): RunReport {
       ...(step.stellarTransactionCode && { stellarTransactionCode: redactAccountMaterial(step.stellarTransactionCode) }),
       ...(step.stellarOperationCodes && { stellarOperationCodes: step.stellarOperationCodes.map(redactAccountMaterial) }),
       message: redactAccountMaterial(step.message),
+      // Issue #32: persisted reports must round-trip the non-secret evidence the
+      // API already returns, including step timing and fee evidence.
+      ...(step.feeCharged !== undefined && { feeCharged: redactAccountMaterial(step.feeCharged) }),
+      ...(step.startedAt !== undefined && { startedAt: redactAccountMaterial(step.startedAt) }),
+      ...(step.completedAt !== undefined && { completedAt: redactAccountMaterial(step.completedAt) }),
+      ...(typeof step.durationMs === "number" && Number.isFinite(step.durationMs) && step.durationMs >= 0 && { durationMs: step.durationMs }),
     })),
     assertions: run.assertions.map((assertion) => ({
       type: assertion.type,

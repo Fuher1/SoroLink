@@ -21,13 +21,18 @@ export function friendbotTimeoutError(failedStepId: string): SafeRunError {
 
 export function horizonTimeoutError(
   request: "transaction submission" | "account loading" | "transaction lookup",
+  retries = 0,
 ): SafeRunError {
   const service = request === "transaction submission"
     ? "Horizon transaction submission"
     : request === "transaction lookup" ? "Horizon transaction lookup" : "Horizon account loading";
+  // Issue #31: once bounded retries are exhausted, the final error states how
+  // many retries were attempted so CI logs distinguish a one-off timeout from
+  // a persistently slow Testnet.
+  const outcome = retries > 0 ? `timed out and failed after ${retries} retries` : "timed out";
   return new SafeRunError({
     code: "HORIZON_UNAVAILABLE",
-    message: `${service} timed out. ${TESTNET_RETRY_SUGGESTION}`,
+    message: `${service} ${outcome}. ${TESTNET_RETRY_SUGGESTION}`,
     category: "network",
     retryable: true,
   });

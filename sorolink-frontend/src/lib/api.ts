@@ -17,6 +17,14 @@ export interface StepResult {
   stellarTransactionCode?: string;
   stellarOperationCodes?: string[];
   message: string;
+  /**
+   * Issue #28: optional step timing evidence from the backend. Older reports
+   * omit these fields, so a missing or malformed value must never invalidate
+   * the report; the dashboard simply hides the elapsed time.
+   */
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
 }
 
 export interface AssertionResult {
