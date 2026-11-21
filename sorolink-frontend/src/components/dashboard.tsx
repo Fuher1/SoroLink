@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
-import { ApiError, RateLimitError, cancelRun, downloadReport, getRun, getScenario, listScenarios, startRun, type JsonValue, type RunReport, type ScenarioDetail, type ScenarioSummary, type StepResult } from "@/lib/api";
+import { ApiError, RateLimitError, downloadReport, getRun, getScenario, listScenarios, startRun, type JsonValue, type RunReport, type ScenarioDetail, type ScenarioSummary } from "@/lib/api";
 
 const terminalStatuses = new Set(["passed", "failed", "cancelled"]);
 const DEFAULT_TAB_TITLE = "SoroLink – Stellar Testing Dashboard";
@@ -63,6 +63,49 @@ export function filterScenario(scenario: ScenarioSummary, filter: ScenarioFilter
   if (filter === "issued-asset") return text.includes("issued") || text.includes("testusd") || scenario.id === "issued-asset-payment";
   if (filter === "expected-failure") return text.includes("fail") || text.includes("missing-trustline") || scenario.id === "missing-trustline";
   return true;
+}
+
+export interface ScenarioTag {
+  key: Exclude<ScenarioFilter, "all">;
+  label: string;
+  color: string;
+  bg: string;
+}
+
+/** Derive accessible category tag badges matching filterScenario categories (#27). */
+export function getScenarioTags(scenario: ScenarioSummary): ScenarioTag[] {
+  const tags: ScenarioTag[] = [];
+  if (filterScenario(scenario, "xlm")) {
+    tags.push({ key: "xlm", label: "XLM", color: "#1d4ed8", bg: "#dbeafe" });
+  }
+  if (filterScenario(scenario, "issued-asset")) {
+    tags.push({ key: "issued-asset", label: "Issued Asset", color: "#6d28d9", bg: "#ede9fe" });
+  }
+  if (filterScenario(scenario, "expected-failure")) {
+    tags.push({ key: "expected-failure", label: "Expected Failure", color: "#b45309", bg: "#fef3c7" });
+  }
+  return tags;
+}
+
+export interface FormattedBalanceDelta {
+  text: string;
+  tone: "positive" | "negative" | "neutral";
+  color: string;
+}
+
+/** Format a numeric balance delta with explicit +/-/0 sign and optional asset code (#22). */
+export function formatBalanceDelta(delta: number | string, asset?: string): FormattedBalanceDelta {
+  const numeric = typeof delta === "number" ? delta : Number(delta);
+  const suffix = asset ? ` ${asset}` : "";
+  if (!Number.isFinite(numeric) || numeric === 0) {
+    return { text: `0${suffix}`, tone: "neutral", color: "#52525b" };
+  }
+  if (numeric > 0) {
+    const absStr = typeof delta === "string" ? delta.replace(/^\+/, "") : String(numeric);
+    return { text: `+${absStr}${suffix}`, tone: "positive", color: "#15803d" };
+  }
+  const absStr = typeof delta === "string" ? delta.replace(/^-/, "") : String(Math.abs(numeric));
+  return { text: `\u2212${absStr}${suffix}`, tone: "negative", color: "#b91c1c" };
 }
 
 export function searchScenario(scenario: ScenarioSummary, query: string): boolean {
@@ -352,7 +395,44 @@ export function Dashboard() {
       lastAnnouncedRef.current = message;
       setLiveAnnouncement(message);
     }
-  }, [run, scenarios]);
+    if (
+      notificationsEnabled &&
+      run &&
+      prev !== null &&
+      (currentStatus === "passed" || currentStatus === "failed") &&
+      typeof Notification !== "undefined" &&
+      Notification.permission === "granted"
+    ) {
+      try {
+        new Notification(`SoroLink run ${currentStatus}`, {
+          body: `Scenario ${run.scenarioId} ${currentStatus}.`,
+        });
+      } catch {
+        // Ignore Notification constructor errors in restricted environments
+      }
+    }
+  }, [run, scenarios, notificationsEnabled]);
+
+  const handleToggleNotifications = async () => {
+    if (notificationsEnabled) {
+      setNotificationsEnabled(false);
+      return;
+    }
+    if (typeof Notification === "undefined" || typeof Notification.requestPermission !== "function") {
+      return;
+    }
+    try {
+      const permission =
+        Notification.permission === "granted"
+          ? "granted"
+          : await Notification.requestPermission();
+      if (permission === "granted") {
+        setNotificationsEnabled(true);
+      }
+    } catch {
+      // Graceful degradation if permission request fails
+    }
+  };
 
   // #25 — Update browser tab title to reflect active run status
   useEffect(() => {
@@ -517,12 +597,13 @@ export function Dashboard() {
 
   const selected = useMemo(() => scenarios.find((scenario) => scenario.id === selectedId), [scenarios, selectedId]);
 
-  async function handleRun() {
-    if (!selectedId) return;
+  async function handleRun(scenarioIdOverride?: unknown) {
+    const targetScenarioId = typeof scenarioIdOverride === "string" ? scenarioIdOverride : selectedId;
+    if (!targetScenarioId) return;
     setIsOffline(false);
     setImportError(null);
     setViewMode("report");
-    if (!selectedId || rateLimitCountdown !== null) return;
+    if (rateLimitCountdown !== null) return;
     setStarting(true);
     setError(null);
     pollAttemptRef.current = 0;
@@ -530,7 +611,7 @@ export function Dashboard() {
     setRun(null);
     try {
       const key = crypto.randomUUID();
-      const newRun = await startRun(selectedId, key);
+      const newRun = await startRun(targetScenarioId, key);
       setRun(newRun);
       setRunIdempotencyKey(crypto.randomUUID());
       const newParams = new URLSearchParams(searchParams?.toString() ?? "");
@@ -793,16 +874,30 @@ export function Dashboard() {
               >
                 <span className="card-index" aria-hidden="true">0{index + 1}</span>
                 <ScenarioIcon kind={scenario.id} />
-                <button
-                  type="button"
-                  className="scenario-select"
-                  aria-pressed={selectedId === scenario.id}
-                  aria-describedby={`scenario-description-${scenario.id}`}
-                >
-                  <span className="scenario-name">{scenario.name}</span>
-                </button>
-                <span className="scenario-description" id={`scenario-description-${scenario.id}`}>{scenario.description}</span>
-                <span className="version" aria-label={`Scenario version ${scenario.version}`} title={`Scenario version ${scenario.version}`}>V{scenario.version}</span>
+                <span className="scenario-name">{scenario.name}</span>
+                <span className="scenario-description">{scenario.description}</span>
+                <span className="scenario-tags" aria-label="Scenario categories" style={{ display: "inline-flex", gap: "6px", flexWrap: "wrap" }}>
+                  {getScenarioTags(scenario).map((tag) => (
+                    <span
+                      key={tag.key}
+                      className="scenario-tag"
+                      data-tag={tag.key}
+                      style={{
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        padding: "2px 8px",
+                        borderRadius: "9999px",
+                        color: tag.color,
+                        backgroundColor: tag.bg,
+                        border: `1px solid ${tag.color}33`,
+                      }}
+                    >
+                      <span className="sr-only">Category: </span>
+                      {tag.label}
+                    </span>
+                  ))}
+                </span>
+                <span className="version">V{scenario.version}</span>
                 <button
                   type="button"
                   className={`favorite-btn ${favorites.has(scenario.id) ? "active" : ""}`}
@@ -920,6 +1015,16 @@ export function Dashboard() {
                 />
               </label>
             )}
+            {typeof Notification !== "undefined" && (
+              <button
+                type="button"
+                className={`filter-pill ${notificationsEnabled ? "active" : ""}`}
+                aria-pressed={notificationsEnabled}
+                onClick={() => void handleToggleNotifications()}
+              >
+                {notificationsEnabled ? "Notifications on" : "Notify on completion"}
+              </button>
+            )}
             {viewMode === "report" && run && (
               <>
                 <div className="report-filters" role="group" aria-label="Report filter">
@@ -935,6 +1040,15 @@ export function Dashboard() {
                     </button>
                   ))}
                 </div>
+                {terminalStatuses.has(run.status) && !isOffline && (
+                  <button
+                    type="button"
+                    className="print-button"
+                    onClick={() => void handleRun(run.scenarioId)}
+                  >
+                    Run again
+                  </button>
+                )}
                 {terminalStatuses.has(run.status) && (
                   <button type="button" className="print-button" onClick={() => window.print()}>
                     Print report
@@ -1438,6 +1552,13 @@ function AssertionRow({ assertion, reportFilter }: { assertion: import("@/lib/ap
   const [expanded, setExpanded] = useState(false);
   const hasDiff = assertion.expected !== undefined || assertion.actual !== undefined;
   const isFailed = assertion.status === "failed";
+  const actualObj =
+    assertion.actual && typeof assertion.actual === "object" && !Array.isArray(assertion.actual)
+      ? (assertion.actual as Record<string, JsonValue>)
+      : null;
+  const deltaVal = actualObj && (typeof actualObj.delta === "number" || typeof actualObj.delta === "string") ? actualObj.delta : null;
+  const assetVal = actualObj && typeof actualObj.asset === "string" ? actualObj.asset : undefined;
+  const formattedDelta = deltaVal !== null ? formatBalanceDelta(deltaVal, assetVal) : null;
 
   return (
     <div className={`assertion report-row ${isFailed && hasDiff ? "assertion--has-diff" : ""}`} hidden={reportFilter === "failed" && assertion.status !== "failed"}>
@@ -1446,6 +1567,15 @@ function AssertionRow({ assertion, reportFilter }: { assertion: import("@/lib/ap
         <span className="label">ASSERTION / {assertion.type}</span>
         <span className="print-status-label">{titleCase(assertion.status)}</span>
         <strong>{assertion.message}</strong>
+        {formattedDelta && (
+          <span
+            className="balance-delta"
+            data-delta-tone={formattedDelta.tone}
+            style={{ color: formattedDelta.color, fontWeight: 600, marginLeft: "8px" }}
+          >
+            {formattedDelta.text}
+          </span>
+        )}
         {hasDiff && (
           <div className="assertion-diff-toggle">
             <button
